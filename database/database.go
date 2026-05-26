@@ -3,6 +3,7 @@ package database
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"auction-backend/config"
 	"auction-backend/models"
@@ -31,6 +32,15 @@ func InitDB(cfg *config.Config) error {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+
 	log.Println("Database connected successfully")
 	return nil
 }
@@ -40,6 +50,7 @@ func AutoMigrate() error {
 		&models.Auction{},
 		&models.Bid{},
 		&models.PriceUpdate{},
+		&models.SyncState{},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to auto migrate: %w", err)

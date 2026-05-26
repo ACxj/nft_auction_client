@@ -56,3 +56,16 @@ type PriceUpdate struct {
 func (PriceUpdate) TableName() string {
 	return "price_updates"
 }
+
+type SyncState struct {
+	ID            uint   `gorm:"primaryKey" json:"id"`
+	ContractAddr  string `gorm:"type:varchar(42);uniqueIndex;not null" json:"contract_addr"`
+	LastBlockNum  uint64 `gorm:"not null;default:0" json:"last_block_num"`
+	LastSyncTime  time.Time `gorm:"not null" json:"last_sync_time"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func (SyncState) TableName() string {
+	return "sync_states"
+}

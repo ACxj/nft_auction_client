@@ -19,13 +19,12 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"gorm.io/gorm"
 )
 
 type EventListener struct {
 	cfg        *config.Config
-	client     *ethclient.Client
+	client     *RetryClient
 	auctionABI abi.ABI
 	stopChan   chan struct{}
 	wg         sync.WaitGroup
@@ -33,7 +32,7 @@ type EventListener struct {
 
 var AuctionABI = `[{"type":"event","name":"AuctionCreated","inputs":[{"name":"auctionId","type":"uint256","indexed":false},{"name":"nftContract","type":"address","indexed":false},{"name":"tokenId","type":"uint256","indexed":false},{"name":"seller","type":"address","indexed":false},{"name":"startingPrice","type":"uint256","indexed":false},{"name":"endTime","type":"uint256","indexed":false},{"name":"acceptedToken","type":"address","indexed":false}]},{"type":"event","name":"BidPlaced","inputs":[{"name":"auctionId","type":"uint256","indexed":false},{"name":"bidder","type":"address","indexed":false},{"name":"amount","type":"uint256","indexed":false},{"name":"token","type":"address","indexed":false},{"name":"amountInUsd","type":"uint256","indexed":false}]},{"type":"event","name":"AuctionEnded","inputs":[{"name":"auctionId","type":"uint256","indexed":false},{"name":"winner","type":"address","indexed":false},{"name":"winningBid","type":"uint256","indexed":false},{"name":"token","type":"address","indexed":false}]},{"type":"event","name":"AuctionCanceled","inputs":[{"name":"auctionId","type":"uint256","indexed":false}]},{"type":"event","name":"WithdrawCompleted","inputs":[{"name":"user","type":"address","indexed":false},{"name":"amount","type":"uint256","indexed":false}]}]`
 
-func NewEventListener(cfg *config.Config, client *ethclient.Client) (*EventListener, error) {
+func NewEventListener(cfg *config.Config, client *RetryClient) (*EventListener, error) {
 	parsedABI, err := abi.JSON(strings.NewReader(AuctionABI))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse ABI: %w", err)
@@ -67,25 +66,50 @@ func (el *EventListener) Start() error {
 func (el *EventListener) pollEvents(contractAddr common.Address) {
 	defer el.wg.Done()
 
-	var lastBlock uint64
+	lastBlock := el.loadLastBlock(contractAddr.Hex())
+	delay := 15 * time.Second
+	const maxBlockRange uint64 = 1000
 
 	for {
 		select {
 		case <-el.stopChan:
+			el.saveLastBlock(contractAddr.Hex(), lastBlock)
 			log.Println("Event listener stopped")
 			return
 		default:
+			currentBlock, err := el.client.BlockNumber(context.Background())
+			if err != nil {
+				log.Printf("Failed to get current block number: %v", err)
+				time.Sleep(delay)
+				delay = minDuration(delay*2, 60*time.Second)
+				continue
+			}
+
+			toBlock := lastBlock + maxBlockRange
+			if toBlock > currentBlock {
+				toBlock = currentBlock
+			}
+
+			if toBlock <= lastBlock {
+				time.Sleep(delay)
+				continue
+			}
+
 			query := ethereum.FilterQuery{
 				Addresses: []common.Address{contractAddr},
 				FromBlock: new(big.Int).SetUint64(lastBlock),
+				ToBlock:   new(big.Int).SetUint64(toBlock),
 			}
 
 			logs, err := el.client.FilterLogs(context.Background(), query)
 			if err != nil {
 				log.Printf("Failed to filter logs: %v", err)
-				time.Sleep(15 * time.Second)
+				time.Sleep(delay)
+				delay = minDuration(delay*2, 60*time.Second)
 				continue
 			}
+
+			delay = 15 * time.Second
 
 			for _, vLog := range logs {
 				el.handleLog(vLog)
@@ -95,12 +119,69 @@ func (el *EventListener) pollEvents(contractAddr common.Address) {
 			}
 
 			if len(logs) > 0 {
-				log.Printf("Processed %d events up to block %d", len(logs), lastBlock)
+				el.saveLastBlock(contractAddr.Hex(), lastBlock)
+				log.Printf("Processed %d events from block %d to %d", len(logs), lastBlock, toBlock)
 			}
 
-			time.Sleep(15 * time.Second)
+			time.Sleep(delay)
 		}
 	}
+}
+
+func (el *EventListener) loadLastBlock(contractAddr string) uint64 {
+	var state models.SyncState
+	err := database.DB.Where("contract_addr = ?", contractAddr).First(&state).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			var latestBid models.Bid
+			if err := database.DB.Order("block_number desc").First(&latestBid).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					log.Println("No previous sync state found, starting from block 0")
+					return 0
+				}
+				log.Printf("Failed to get latest bid: %v", err)
+				return 0
+			}
+			log.Printf("Loaded last block from bids: %d", latestBid.BlockNumber)
+			return latestBid.BlockNumber
+		}
+		log.Printf("Failed to load sync state: %v", err)
+		return 0
+	}
+	log.Printf("Loaded sync state: contract=%s, lastBlock=%d", contractAddr, state.LastBlockNum)
+	return state.LastBlockNum
+}
+
+func (el *EventListener) saveLastBlock(contractAddr string, blockNum uint64) {
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		var state models.SyncState
+		err := tx.Where("contract_addr = ?", contractAddr).First(&state).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				newState := models.SyncState{
+					ContractAddr: contractAddr,
+					LastBlockNum: blockNum,
+					LastSyncTime: time.Now(),
+				}
+				return tx.Create(&newState).Error
+			}
+			return err
+		}
+		return tx.Model(&state).Updates(map[string]interface{}{
+			"last_block_num": blockNum,
+			"last_sync_time": time.Now(),
+		}).Error
+	})
+	if err != nil {
+		log.Printf("Failed to save sync state: %v", err)
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (el *EventListener) Stop() {
@@ -157,10 +238,14 @@ func (el *EventListener) handleAuctionCreated(vLog types.Log) {
 		IsActive:      true,
 	}
 
-	var count int64
-	database.DB.Model(&models.Auction{}).Where("auction_id = ?", auctionID.Uint64()).Count(&count)
-	if count > 0 {
+	var existingAuction models.Auction
+	err = database.DB.Where("auction_id = ?", auctionID.Uint64()).First(&existingAuction).Error
+	if err == nil {
 		log.Printf("AuctionCreated (duplicate skipped): ID=%d", auctionID.Uint64())
+		return
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Printf("Failed to check auction existence: %v", err)
 		return
 	}
 
@@ -330,17 +415,14 @@ func (el *EventListener) SyncHistoricalEvents(startBlock uint64) error {
 }
 
 func SyncAuctionsFromChain(el *EventListener) error {
-	db := database.DB
+	contractAddr := el.cfg.ContractAddr
+	lastBlock := el.loadLastBlock(contractAddr)
 
-	var latestBlock models.Bid
-	if err := db.Order("block_number desc").First(&latestBlock).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Println("No bids found, starting from block 0")
-			return el.SyncHistoricalEvents(0)
-		}
-		return err
+	if lastBlock > 0 {
+		log.Printf("Syncing from block %d", lastBlock+1)
+		return el.SyncHistoricalEvents(lastBlock + 1)
 	}
 
-	log.Printf("Syncing from block %d", latestBlock.BlockNumber+1)
-	return el.SyncHistoricalEvents(latestBlock.BlockNumber + 1)
+	log.Println("No previous sync state, starting from block 0")
+	return el.SyncHistoricalEvents(0)
 }

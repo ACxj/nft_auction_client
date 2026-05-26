@@ -243,26 +243,21 @@ func GetMarketStats(c *gin.Context) {
 	defer cancel()
 
 	var stats struct {
-		TotalAuctions  int64
-		ActiveAuctions int64
-		TotalBids      int64
-		HighestBid     float64
-		HighestBidUSD  float64
+		TotalAuctions  int64   `gorm:"column:total_auctions"`
+		ActiveAuctions int64   `gorm:"column:active_auctions"`
+		TotalBids      int64   `gorm:"column:total_bids"`
+		HighestBid     float64 `gorm:"column:highest_bid"`
+		HighestBidUSD  float64 `gorm:"column:highest_bid_usd"`
 	}
 
 	database.DB.WithContext(dbCtx).Raw(`
 		SELECT
+			COUNT(*) as total_auctions,
 			COALESCE(SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 0) as active_auctions,
-			COUNT(*) as total_auctions
+			COALESCE((SELECT COUNT(*) FROM bids), 0) as total_bids,
+			COALESCE((SELECT MAX(amount) FROM bids), 0) as highest_bid,
+			COALESCE((SELECT MAX(amount_usd) FROM bids), 0) as highest_bid_usd
 		FROM auctions
-	`).Scan(&stats)
-
-	database.DB.WithContext(dbCtx).Raw(`
-		SELECT
-			COUNT(*) as total_bids,
-			COALESCE(MAX(amount), 0) as highest_bid,
-			COALESCE(MAX(amount_usd), 0) as highest_bid_usd
-		FROM bids
 	`).Scan(&stats)
 
 	c.JSON(http.StatusOK, gin.H{
